@@ -1,0 +1,460 @@
+---
+title: "ESAME ASL"
+author: "Carmela Pia Senatore"
+date: "2023-12-12"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(MASS)
+library(knitr)
+
+
+library(randomForest)
+library(ipred)       
+library(caret)
+library(gbm)
+library(labeling)
+
+```
+
+# 1. Definizione del dataset 
+
+
+```{r}
+# Funzione per simulare dati dal modello prescritto nella traccia 
+
+simulate_data <- function(n, sig = NULL, media_Y_A = NULL, media_Y_B = NULL, seed = NULL) {
+  # Poichè i risultati devono essere riproducibili e i dati devono essere gli     stessi viene impostato a mano il seed.
+  if (is.null(seed)) {
+    set.seed(123) # Imposto il seed per la riproducibilità, qualora non venisse fornito in input
+  }
+  
+  # Simulazione della variabile oggetto di studio Y
+  Y <- as.factor(sample(c("A", "B"), n, replace = TRUE))
+  
+  # Simulazione variabili continue con distribuzione congiunta normale
+    # Verifica se i parametri sono forniti dall'esterno o utilizza i valori predefiniti interni
+  if (is.null(sig)) {
+          # Matrice scelta
+    sig <- matrix(diag(3), nrow = 3, ncol = 3)
+  }
+    # Generiamo i vettori medi per le due categorie di Y, possono variare
+
+  if (is.null(media_Y_A)) {
+    media_Y_A <- c(5, 8, 10)
+  }
+  
+  if (is.null(media_Y_B)) {
+    media_Y_B <- c(4, 6, 12)
+  }
+  
+
+  # Generiamo i dati per le diverse categorie; 
+  #Il ciclo  for funziona in questo modo: 
+  # per i da 1:n , ovvero il numero di osservazioni da campionare definito in input della funzione; 
+  # Qualora la Y assegnata all'unità statistica i appartiene alla Y di livello A, allora vengono generati valori da una normale multivariata con i parametri del vettore di media e varianza definiti in input (o preimpostati nella funzione) della funzione per il primo gruppo inserendoli nella nuova matrice Dati_A. Altrimenti, genera valori da una normale multivariata ma con parametri di vettore di media  per il secondo gruppo, inserendoli in una nuova matrice dati_B. 
+  # Al  termine delle iterazioni il ciclo si ferma.   dati_A <- matrix(NA, nrow = 0, ncol = 3)
+  dati_A <- matrix(NA, nrow = 0, ncol = 3)
+  dati_B <- matrix(NA, nrow = 0, ncol = 3)
+  
+  for (i in 1:n) {    
+    if (Y[i] == "A") {
+      dati_A <- rbind(dati_A, mvrnorm(1, mu = media_Y_A, Sigma = sig))
+    } else {
+      dati_B <- rbind(dati_B, mvrnorm(1, mu = media_Y_B, Sigma = sig))
+    }
+  }
+    #assemblo i due dataset dei due gruppi
+
+  Y_1 <- rep('A', each = nrow(dati_A))
+  Y_2 <- rep('B', each = nrow(dati_B))
+  dati_A <- cbind(dati_A, Y_1)
+  dati_B <- cbind(dati_B, Y_2)
+  
+  dat <- rbind(dati_A, dati_B)
+  
+  
+  # Simulazione delle altre variabili
+  
+  # Variabili non numeriche: 
+  # in maniera arbitraria, le variabili non numeriche sono state definite come :   
+  # x4: livelli (-1,1)
+  # x5: (0,1,2)
+  X_non_numeric <- data.frame(X4 = as.factor(sample(c("-1", "1"), n, replace = TRUE)),
+                               X5 = as.factor(sample(c("0", "1", "2"), n, replace = TRUE)))
+  
+  # Variabili numeriche: 
+  # in maniera arbitraria, le variabili non numeriche sono state definite come :
+  # x6 e x7 da una normale; 
+  # x8: valori compresi tra 20 e 50 
+  # x9: generati da t di student con 3 gradi di libertà
+  # x10: valori tra -10 e 10 
+  X_numeric <- data.frame(X6 = rnorm(n),
+                          X7 = rnorm(n),
+                          X8 = sample(20:50, n, replace = TRUE),
+                          X9 = rt(n, df = 3),
+                          X10 = sample(-10:10, n, replace = TRUE))
+  
+  simulated_data <- cbind.data.frame(Y = dat[, 4], X1 = dat[, 1], X2 = dat[, 2], X3 = dat[, 3], X_non_numeric, X_numeric)
+  # Creazione del dataset assemblando le variabili generate precedentemente
+  return(simulated_data)
+}
+
+
+```
+
+
+
+# 2.ANALISI MONTECARLO
+
+```{r}
+# Imposta il seed per la riproducibilità
+set.seed(123)
+dataset<-simulate_data(250)
+dataset$Y<-as.factor(dataset$Y)
+dataset$X1<-as.numeric(dataset$X1)
+dataset$X2<-as.numeric(dataset$X2)
+dataset$X3<-as.numeric(dataset$X3)  
+
+#Cambio i livelli di fattorizzazione della variabile Y con A negativo e B positivo
+dataset$Y<-recode(dataset$Y, "A" = 0, "B" = 1)
+
+# Numero di repliche Monte Carlo
+R <- 50
+
+# Inizializzo vettori per salvare i risultati
+error_rates_baggin <- numeric(R)
+error_rates_r <- numeric(R)
+error_rates_boostin <- numeric(R)
+
+
+# Simulazione Monte Carlo
+for (replica in 1:R) {
+
+  # Divido il dataset in training set e test set per farne valutazione
+  set.seed(replica)
+  train_indices <- createDataPartition(dataset$Y, p = 0.8, list = FALSE)
+  train_data <- dataset[train_indices, ]
+  test_data <- dataset[-train_indices, ]
+  
+  #Adatto i diversi dataset per diverse formattazioni della variabile Y
+  train_n <- train_data 
+  train_f <- train_data
+  train_f$Y<-recode(train_f$Y, "0"="A", "1"="B")
+  train_f$Y<-as.factor(train_f$Y)
+  levels(train_f$Y) <- c("A", "B")
+  
+  test_n <- test_data 
+  test_f <- test_data
+  test_f$Y<-recode(test_f$Y, "0"="A", "1"="B")
+  test_f$Y<-as.factor(test_f$Y)
+  levels(test_f$Y) <- c("A", "B")
+  
+  # Bagging
+  bagging_model <- bagging(Y ~ ., data = train_f, coob= TRUE, mfinal = 70) #addestramento del modello
+  pred_bagging <- predict(bagging_model, newdata = test_f, type="class") #previsione dle modello 
+  error_rates_baggin[replica] <- mean (pred_bagging != test_f$Y) #l'errore viene aggiornato e inserito nel vettore degli errori del modello 
+
+
+  # Random Forest
+  rf_model <- randomForest(Y ~ ., data = train_f)#addestramento del modello
+  pred_rf <- predict(rf_model, newdata = test_f, type="class")
+  error_rates_r[replica] <- mean(pred_rf!=test_f$Y)
+  
+  
+  # Boosting
+  boosting_model<-gbm(Y ~ .,data = train_n,
+            distribution = "adaboost",cv.folds =10 ,n.trees =100)#addestramento del modello
+  best_ntrees <- gbm.perf(boosting_model, method = "cv")
+  pred_boosting <-  predict.gbm(object = boosting_model,
+                     newdata = test_n,
+                     n.trees = best_ntrees,
+                     type = "response")
+  pred_class <- ifelse(pred_boosting>=0.5, 1, 0)
+  error_rates_boostin[replica] <- mean( pred_class != test_n$Y )
+}
+
+# Calcolo il valore atteso e il Monte Carlo Standard Error per ciascun metodo
+mean_error_baggin <- mean(error_rates_baggin)
+se_error_baggin <- sd(error_rates_baggin) / sqrt(R)
+
+mean_error_r <- mean(error_rates_r)
+se_error_r <- sd(error_rates_r) / sqrt(R)
+
+mean_error_boostin <- mean(error_rates_boostin)
+se_error_boostin <- sd(error_rates_boostin) / sqrt(R)
+
+
+# Stampo i risultati
+cat("Bagging: Mean Error =", mean_error_baggin, "±", se_error_baggin, "\n")
+cat("Boosting: Mean Error =", mean_error_boostin, "±", se_error_boostin, "\n")
+cat("Random Forest: Mean Error =", mean_error_r, "±", se_error_r, "\n")
+
+```
+
+```{r}
+#Grafico delle distribuzioni degli errori
+error_data <- data.frame(
+  Method = rep(c("Bagging", "Random Forest", "Boosting"), each = length(error_rates_baggin)),
+  ErrorRate = c(error_rates_baggin, error_rates_r, error_rates_boostin)
+)
+
+boxplot(ErrorRate ~ Method, data = error_data, main = "Error Rates Comparison", col = c("lightblue", "lightgreen", "lightcoral"))
+
+```
+
+
+
+*Tabella 1: stima errore e MCSE*
+
+|  Classificatore | Stima dell'errore | MCSE    |
+|----------------:|:------------------|---------|
+|       "Bagging" | 0.0828            | 0.00481 |
+| "Random Forest" | 0.09            |  0.00436 |
+|      "Boosting" |   0.0864         | 0.00486 |
+
+
+
+```{r}
+
+
+#Analisi per numero di repliche = 100, ho provato a costruire una funzione ma aumentava drasticamente il tempo di ricorsione per i risultati 
+R <- 100
+
+# Inizializzo vettori per salvare i risultati
+error_rates_bagging1 <- numeric(R)
+error_rates_rf1 <- numeric(R)
+error_rates_boosting1 <- numeric(R)
+
+
+# Simulazione Monte Carlo
+for (replica in 1:R) {
+
+  # Divido il dataset in training set e test set per farne valutazione
+  set.seed(replica)
+  train_indices <- createDataPartition(dataset$Y, p = 0.8, list = FALSE)
+  train_data <- dataset[train_indices, ]
+  test_data <- dataset[-train_indices, ]
+  
+  #Adattare i diversi dataset per diverse formattazioni della variabile Y
+  train_n <- train_data 
+  train_f <- train_data
+  train_f$Y<-recode(train_f$Y, "0"="A", "1"="B")
+  train_f$Y<-as.factor(train_f$Y)
+  levels(train_f$Y) <- c("A", "B")
+  
+  test_n <- test_data 
+  test_f <- test_data
+  test_f$Y<-recode(test_f$Y, "0"="A", "1"="B")
+  test_f$Y<-as.factor(test_f$Y)
+  levels(test_f$Y) <- c("A", "B")
+  
+  # Bagging
+  bagging_model <- bagging(Y ~ ., data = train_f, coob= TRUE, mfinal = 70) #addestramento del modello
+  pred_bagging <- predict(bagging_model, newdata = test_f, type="class")
+  error_rates_bagging1[replica] <- mean (pred_bagging != test_f$Y)
+
+
+  # Random Forest
+  rf_model <- randomForest(Y ~ ., data = train_f) #addestramento del modello
+  pred_rf <- predict(rf_model, newdata = test_f, type="class")
+  error_rates_rf1[replica] <- mean(pred_rf!=test_f$Y)
+  
+  
+  # Boosting
+  boosting_model<-gbm(Y ~ .,data = train_n,
+            distribution = "adaboost",cv.folds =10 ,n.trees =100)#addestramento del modello
+  best_ntrees <- gbm.perf(boosting_model, method = "cv")
+  pred_boosting <-  predict.gbm(object = boosting_model,
+                     newdata = test_n,
+                     n.trees = best_ntrees,
+                     type = "response")
+  pred_class <- ifelse(pred_boosting>=0.5, 1, 0)
+  error_rates_boosting1[replica] <- mean( pred_class != test_n$Y )
+}
+
+# Calcolo il valore atteso e il Monte Carlo Standard Error per ciascun metodo
+mean_error_bagging1 <- mean(error_rates_bagging1)
+se_error_bagging1 <- sd(error_rates_bagging1) / sqrt(R)
+
+mean_error_rf1 <- mean(error_rates_rf1)
+se_error_rf1 <- sd(error_rates_rf1) / sqrt(R)
+
+mean_error_boosting1 <- mean(error_rates_boosting1)
+se_error_boosting1 <- sd(error_rates_boosting1) / sqrt(R)
+
+
+# Stampo i risultati
+cat("Bagging: Mean Error =", mean_error_bagging1, "±", se_error_bagging1, "\n")
+cat("Boosting: Mean Error =", mean_error_boosting1, "±", se_error_boosting1, "\n")
+cat("Random Forest: Mean Error =", mean_error_rf1, "±", se_error_rf1, "\n")
+```
+
+```{r}
+
+#Grafico della distribuzione degli errori
+error_data <- data.frame(
+  Method = rep(c("Bagging", "Random Forest", "Boosting"), each = length(error_rates_bagging1)),
+  ErrorRate = c(error_rates_bagging1, error_rates_rf1, error_rates_boosting1)
+)
+
+boxplot(ErrorRate ~ Method, data = error_data, main = "Error Rates Comparison R=100, n=250",ylab= "error rate", col = c("lightblue", "lightgreen", "lightcoral"),ylim = c(0, 0.15))
+
+```
+
+
+
+```{r}
+
+#numero di rpeliche: 300
+R <- 300
+
+# Inizializzo vettori per salvare i risultati
+error_rates_bagging <- numeric(R)
+error_rates_rf <- numeric(R)
+error_rates_boosting <- numeric(R)
+
+
+# Simulazione Monte Carlo
+for (replica in 1:R) {
+
+  # Divido il dataset in training set e test set per farne valutazione
+  set.seed(replica)
+  train_indices <- createDataPartition(dataset$Y, p = 0.8, list = FALSE)
+  train_data <- dataset[train_indices, ]
+  test_data <- dataset[-train_indices, ]
+  
+  #Adatto i diversi dataset per diverse formattazioni della variabile Y
+  train_n <- train_data 
+  train_f <- train_data
+  train_f$Y<-recode(train_f$Y, "0"="A", "1"="B")
+  train_f$Y<-as.factor(train_f$Y)
+  levels(train_f$Y) <- c("A", "B")
+  
+  test_n <- test_data 
+  test_f <- test_data
+  test_f$Y<-recode(test_f$Y, "0"="A", "1"="B")
+  test_f$Y<-as.factor(test_f$Y)
+  levels(test_f$Y) <- c("A", "B")
+  
+  # Bagging
+  bagging_model <- bagging(Y ~ ., data = train_f, coob= TRUE, mfinal = 70) #addestramento del modello
+  pred_bagging <- predict(bagging_model, newdata = test_f, type="class")
+  error_rates_bagging[replica] <- mean (pred_bagging != test_f$Y)
+
+
+  # Random Forest
+  rf_model <- randomForest(Y ~ ., data = train_f)#addestramento del modello
+  pred_rf <- predict(rf_model, newdata = test_f, type="class")
+  error_rates_rf[replica] <- mean(pred_rf!=test_f$Y)
+  
+  
+  # Boosting
+  boosting_model<-gbm(Y ~ .,data = train_n,
+            distribution = "adaboost",cv.folds =10 ,n.trees =100)#addestramento del modello
+  best_ntrees <- gbm.perf(boosting_model, method = "cv")
+  pred_boosting <-  predict.gbm(object = boosting_model,
+                     newdata = test_n,
+                     n.trees = best_ntrees,
+                     type = "response")
+  pred_class <- ifelse(pred_boosting>=0.5, 1, 0)
+  error_rates_boosting[replica] <- mean( pred_class != test_n$Y )
+}
+
+# Calcolo il valore atteso e il Monte Carlo Standard Error per ciascun metodo
+mean_error_bagging <- mean(error_rates_bagging)
+se_error_bagging <- sd(error_rates_bagging) / sqrt(R)
+
+mean_error_rf <- mean(error_rates_rf)
+se_error_rf <- sd(error_rates_rf) / sqrt(R)
+
+mean_error_boosting <- mean(error_rates_boosting)
+se_error_boosting <- sd(error_rates_boosting) / sqrt(R)
+
+
+cat("Bagging: Mean Error =", mean_error_bagging, "±", se_error_bagging, "\n")
+cat("Boosting: Mean Error =", mean_error_boosting, "±", se_error_boosting, "\n")
+cat("Random Forest: Mean Error =", mean_error_rf, "±", se_error_rf, "\n")
+```
+
+
+```{r}
+
+#Grafico degli errori
+error_data <- data.frame(
+  Method = rep(c("Bagging", "Random Forest", "Boosting"), each = length(error_rates_bagging)),
+  ErrorRate = c(error_rates_bagging, error_rates_rf, error_rates_boosting)
+)
+
+boxplot(ErrorRate ~ Method, data = error_data, main = "Error Rates Comparison R=300, n=250",ylab= "error rate", col = c("lightblue", "lightgreen", "lightcoral"),ylim = c(0, 0.15))
+```
+
+
+
+*tabella 2: confronti per diversi R*
+
+
+|  Classificatore | N Repliche | Stima dell'errore | MCSE    |
+|----------------:|:------------------|---------|---------|
+|       "Bagging" | 100           | 0.0856 |0.0034|
+| "Random Forest" | 100            | 0.086 |0.0033|
+|      "Boosting" | 100            | 0.0836| 0.0033|
+|       "Bagging" | 300           | 0.0874 |0.0021|
+| "Random Forest" | 300            | 0.083 |0.0020|
+|      "Boosting" | 300            | 0.081 |0.0019|
+
+
+
+
+
+```{r}
+
+
+##GRAFICO FINALE 
+
+# Dati per Bagging
+data_bagging <- data.frame(
+    R = c(50, 100, 300),
+    Stima_errore = c(0.0828, 0.0856, 0.0874),
+    MCSE = c(0.00481, 0.0034, 0.0021)
+)
+
+# Dati per Random Forest
+data_rf <- data.frame(
+    R = c(50, 100, 300),
+    Stima_errore = c(0.09, 0.086, 0.083),
+    MCSE = c(0.00486, 0.0033, 0.002)
+)
+
+# Dati per Boosting
+data_boosting <- data.frame(
+    R = c(50, 100, 300),
+    Stima_errore = c(0.0864, 0.0836, 0.081),
+    MCSE = c(0.00486, 0.0033, 0.0019)
+)
+
+ggplot() +
+    geom_line(data = data_bagging, aes(x = R, y = Stima_errore, color = "Bagging"), group = 1) +
+    geom_errorbar(data = data_bagging, aes(x = R, ymin = Stima_errore - MCSE, ymax = Stima_errore + MCSE, color = "Bagging"), width = 0.2) +
+    
+    geom_line(data = data_rf, aes(x = R, y = Stima_errore, color = "Random Forest"), group = 1) +
+    geom_errorbar(data = data_rf, aes(x = R, ymin = Stima_errore - MCSE, ymax = Stima_errore + MCSE, color = "Random Forest"), width = 0.2) +
+    
+    geom_line(data = data_boosting, aes(x = R, y = Stima_errore, color = "Boosting"), group = 1) +
+    geom_errorbar(data = data_boosting, aes(x = R, ymin = Stima_errore - MCSE, ymax = Stima_errore + MCSE, color = "Boosting"), width = 0.2) +
+    
+    labs(title = "Confronto tra Classificatori per diversi R",
+         x = "Numero di Repliche",
+         y = "Stima dell'errore") +
+    theme_minimal() +
+    scale_color_manual(values = c("Bagging" = "blue", "Random Forest" = "green", "Boosting" = "red"))
+```
+
+
+
+
+
